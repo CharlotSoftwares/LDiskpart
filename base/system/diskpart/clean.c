@@ -1,248 +1,116 @@
 /*
- * PROJECT:         ReactOS DiskPart
- * LICENSE:         GPL - See COPYING in the top level directory
+ * PROJECT:         Linux DiskPart
+ * LICENSE:         GPL
  * FILE:            base/system/diskpart/clean.c
  * PURPOSE:         Manages all the partitions of the OS in an interactive way.
- * PROGRAMMERS:     Lee Schroeder
+ * PROGRAMMERS:     Lee Schroeder, Radiump
  */
 
-#include "diskpart.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 
-#define NDEBUG
-#include <debug.h>
+#define SECTOR_SIZE 512
+#define MB (1024 * 1024)
 
-
-BOOL
-clean_main(
-    _In_ INT argc,
-    _In_ PWSTR *argv)
+int main(int argc, char *argv[])
 {
-    PLIST_ENTRY Entry;
-    PPARTENTRY PartEntry;
-    PVOLENTRY VolumeEntry;
-    BOOL bAll = FALSE;
-    PUCHAR SectorsBuffer = NULL;
-    ULONG LayoutBufferSize, Size;
-    INT i;
-    WCHAR Buffer[MAX_PATH];
-    UNICODE_STRING Name;
-    OBJECT_ATTRIBUTES ObjectAttributes;
-    IO_STATUS_BLOCK IoStatusBlock;
-    HANDLE FileHandle = NULL;
-    LARGE_INTEGER Offset, Count, MaxCount;
-    NTSTATUS Status;
-
-    DPRINT("Clean()\n");
-
-    if (CurrentDisk == NULL)
-    {
-        ConResPuts(StdOut, IDS_SELECT_NO_DISK);
-        return TRUE;
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <device> [all]\n", argv[0]);
+        fprintf(stderr, "Example: %s /dev/sdx all\n", argv[0]);
+        return 1;
     }
 
-    /* Do not allow to clean the boot disk */
-    if ((CurrentDisk->BiosFound == TRUE) &&
-        (CurrentDisk->BiosDiskNumber == 0))
-    {
-        ConResPuts(StdOut, IDS_CLEAN_SYSTEM);
-        return TRUE;
+    const char *device_path = argv[1];
+    int wipe_all = 0;
+
+    if (argc > 2 && strcmp(argv[2], "all") == 0) {
+        wipe_all = 1;
     }
 
-    for (i = 1; i < argc; i++)
-    {
-        if (_wcsicmp(argv[1], L"all") == 0)
-        {
-            bAll = TRUE;
-        }
+    printf("Opening device: %s\n", device_path);
+    int fd = open(device_path, O_RDWR);
+    if (fd < 0) {
+        perror("Failed to open device");
+        return 1;
     }
 
-    /* Dismount and remove all logical partitions */
-    while (!IsListEmpty(&CurrentDisk->LogicalPartListHead))
-    {
-        Entry = RemoveHeadList(&CurrentDisk->LogicalPartListHead);
-        PartEntry = CONTAINING_RECORD(Entry, PARTENTRY, ListEntry);
+    // Get device size
+    off_t device_size = lseek(fd, 0, SEEK_END);
+    if (device_size == -1) {
+        perror("Failed to get device size");
+        close(fd);
+        return 1;
+    }
+    printf("Device size: %lld bytes (%.2f GB)\n", (long long)device_size, device_size / (1024.0 * 1024.0 * 1024.0));
 
-        /* Dismount the logical partition */
-        if (PartEntry->PartitionType != 0)
-        {
-            DismountVolume(PartEntry);
-            VolumeEntry = GetVolumeFromPartition(PartEntry);
-            if (VolumeEntry)
-                RemoveVolume(VolumeEntry);
-        }
-
-        /* Delete it */
-        RtlFreeHeap(RtlGetProcessHeap(), 0, PartEntry);
+    // Allocate 1MB zero buffer
+    void *zero_buffer = calloc(1, MB);
+    if (!zero_buffer) {
+        fprintf(stderr, "Failed to allocate zero buffer\n");
+        close(fd);
+        return 1;
     }
 
-    /* Dismount and remove all primary partitions */
-    while (!IsListEmpty(&CurrentDisk->PrimaryPartListHead))
-    {
-        Entry = RemoveHeadList(&CurrentDisk->PrimaryPartListHead);
-        PartEntry = CONTAINING_RECORD(Entry, PARTENTRY, ListEntry);
+    ssize_t written;
+    off_t offset;
 
-        /* Dismount the primary partition */
-        if ((PartEntry->PartitionType != 0) &&
-            (IsContainerPartition(PartEntry->PartitionType) == FALSE))
-        {
-            DismountVolume(PartEntry);
-            VolumeEntry = GetVolumeFromPartition(PartEntry);
-            if (VolumeEntry)
-                RemoveVolume(VolumeEntry);
-        }
+    if (wipe_all) {
+        printf("Wiping entire device with zeros...\n");
 
-        /* Delete it */
-        RtlFreeHeap(RtlGetProcessHeap(), 0, PartEntry);
-    }
+        off_t total_written = 0;
+        off_t to_write = device_size;
+        while (to_write > 0) {
+            ssize_t chunk = (to_write > MB) ? MB : to_write;
 
-    /* Initialize the disk entry */
-    CurrentDisk->ExtendedPartition = NULL;
-    CurrentDisk->Dirty = FALSE;
-    CurrentDisk->NewDisk = TRUE;
-    CurrentDisk->NoMbr = TRUE;
-
-    /* Wipe the layout buffer */
-    RtlFreeHeap(RtlGetProcessHeap(), 0, CurrentDisk->LayoutBuffer);
-
-    LayoutBufferSize = sizeof(DRIVE_LAYOUT_INFORMATION) +
-                       ((4 - ANYSIZE_ARRAY) * sizeof(PARTITION_INFORMATION));
-    CurrentDisk->LayoutBuffer = RtlAllocateHeap(RtlGetProcessHeap(),
-                                                HEAP_ZERO_MEMORY,
-                                                LayoutBufferSize);
-    if (CurrentDisk->LayoutBuffer == NULL)
-    {
-        DPRINT1("Failed to allocate the disk layout buffer!\n");
-        return TRUE;
-    }
-
-    /* Allocate a 1MB sectors buffer */
-    SectorsBuffer = RtlAllocateHeap(RtlGetProcessHeap(),
-                                    HEAP_ZERO_MEMORY,
-                                    1024 * 1024);
-    if (SectorsBuffer == NULL)
-    {
-        DPRINT1("Failed to allocate the sectors buffer!\n");
-        goto done;
-    }
-
-    /* Open the disk for writing */
-    StringCchPrintfW(Buffer, ARRAYSIZE(Buffer),
-                     L"\\Device\\Harddisk%d\\Partition0",
-                     CurrentDisk->DiskNumber);
-
-    RtlInitUnicodeString(&Name, Buffer);
-
-    InitializeObjectAttributes(&ObjectAttributes,
-                               &Name,
-                               OBJ_CASE_INSENSITIVE,
-                               NULL,
-                               NULL);
-
-    Status = NtOpenFile(&FileHandle,
-                        GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
-                        &ObjectAttributes,
-                        &IoStatusBlock,
-                        0,
-                        FILE_SYNCHRONOUS_IO_NONALERT);
-    if (!NT_SUCCESS(Status))
-    {
-        DPRINT1("Failed to open the disk! (Status 0x%08lx)\n", Status);
-        ConResPuts(StdOut, IDS_CLEAN_FAIL);
-        goto done;
-    }
-
-    /* Clean sectors */
-    if (bAll)
-    {
-        MaxCount.QuadPart = (CurrentDisk->SectorCount.QuadPart * CurrentDisk->BytesPerSector) / (1024 * 1024);
-        for (Count.QuadPart = 0; Count.QuadPart < MaxCount.QuadPart; Count.QuadPart++)
-        {
-            Offset.QuadPart = Count.QuadPart * (1024 * 1024);
-            Status = NtWriteFile(FileHandle,
-                                 NULL,
-                                 NULL,
-                                 NULL,
-                                 &IoStatusBlock,
-                                 SectorsBuffer,
-                                 1024 * 1024,
-                                 &Offset,
-                                 NULL);
-            if (!NT_SUCCESS(Status))
-            {
-                DPRINT1("Failed to write MB! (Status 0x%08lx)\n", Status);
-                ConResPuts(StdOut, IDS_CLEAN_FAIL);
-                goto done;
+            offset = lseek(fd, total_written, SEEK_SET);
+            if (offset == -1) {
+                perror("Failed to seek");
+                break;
             }
-        }
 
-        Size = (ULONG)(CurrentDisk->SectorCount.QuadPart * CurrentDisk->BytesPerSector) % (1024 * 1024);
-        if (Size != 0)
-        {
-            Offset.QuadPart += (1024 * 1024);
-            Status = NtWriteFile(FileHandle,
-                                 NULL,
-                                 NULL,
-                                 NULL,
-                                 &IoStatusBlock,
-                                 SectorsBuffer,
-                                 Size,
-                                 &Offset,
-                                 NULL);
-            if (!NT_SUCCESS(Status))
-            {
-                DPRINT1("Failed to write the last part! (Status 0x%08lx)\n", Status);
-                ConResPuts(StdOut, IDS_CLEAN_FAIL);
-                goto done;
+            written = write(fd, zero_buffer, chunk);
+            if (written == -1) {
+                perror("Failed to write zeros");
+                break;
             }
+
+            total_written += written;
+            to_write -= written;
+
+            printf("\rProgress: %.2f%%", (total_written * 100.0) / device_size);
+            fflush(stdout);
         }
+        printf("\n");
     }
-    else
-    {
-        /* Clean the first MB */
-        Offset.QuadPart = 0;
-        Status = NtWriteFile(FileHandle,
-                             NULL,
-                             NULL,
-                             NULL,
-                             &IoStatusBlock,
-                             SectorsBuffer,
-                             1024 * 1024,
-                             &Offset,
-                             NULL);
-        if (!NT_SUCCESS(Status))
-        {
-            DPRINT1("Failed to write the first MB! (Status 0x%08lx)\n", Status);
-            ConResPuts(StdOut, IDS_CLEAN_FAIL);
-            goto done;
+    else {
+        printf("Wiping first MB...\n");
+        offset = lseek(fd, 0, SEEK_SET);
+        if (offset == -1 || write(fd, zero_buffer, MB) == -1) {
+            perror("Failed to wipe first MB");
+            free(zero_buffer);
+            close(fd);
+            return 1;
         }
 
-        /* Clean the last MB */
-        Offset.QuadPart = (CurrentDisk->SectorCount.QuadPart * CurrentDisk->BytesPerSector) - (1024 * 1024);
-        Status = NtWriteFile(FileHandle,
-                             NULL,
-                             NULL,
-                             NULL,
-                             &IoStatusBlock,
-                             SectorsBuffer,
-                             1024 * 1024,
-                             &Offset,
-                             NULL);
-        if (!NT_SUCCESS(Status))
-        {
-            DPRINT1("Failed to write the last MB! (Status 0x%08lx)\n", Status);
-            ConResPuts(StdOut, IDS_CLEAN_FAIL);
-            goto done;
+        printf("Wiping last MB...\n");
+        offset = lseek(fd, device_size - MB, SEEK_SET);
+        if (offset == -1 || write(fd, zero_buffer, MB) == -1) {
+            perror("Failed to wipe last MB");
+            free(zero_buffer);
+            close(fd);
+            return 1;
         }
     }
 
-    ConResPuts(StdOut, IDS_CLEAN_SUCCESS);
+    printf("Disk clean operation completed successfully.\n");
 
-done:
-    if (FileHandle != NULL)
-        NtClose(FileHandle);
+    free(zero_buffer);
+    close(fd);
 
-    if (SectorsBuffer != NULL)
-        RtlFreeHeap(RtlGetProcessHeap(), 0, SectorsBuffer);
-
-    return TRUE;
+    return 0;
 }
