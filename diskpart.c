@@ -13,7 +13,7 @@
 
 #define MAX_STRING_SIZE 256
 
-// Dummy implementations for missing functions and strings
+// Dummy implementations for missing functions and strings cuz am lazy
 void ShowHeader(void)
 {
     char hostname[MAX_STRING_SIZE] = {0};
@@ -35,7 +35,7 @@ int InterpretScript(const char *line)
 
 void InterpretMain(void)
 {
-    // TODO: Implement interactive interpreter here
+    // TODO: Implement interactive interpreter here (maybe)
     printf("Starting interactive mode...\n");
     // Placeholder loop (implement real CLI parser)
     char line[256];
