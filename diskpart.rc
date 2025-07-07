@@ -1,0 +1,26 @@
+/* diskpart_info.h - replaces resource strings */
+
+#define DISKPART_FILE_DESCRIPTION   "Disk Partitioning Tool"
+#define DISKPART_INTERNAL_NAME      "diskpart"
+#define DISKPART_ORIGINAL_FILENAME  "diskpart"
+#define DISKPART_ORIGINAL_COPYRIGHT "(C) 2011 Lee Schroeder"
+
+/* Localization: use gettext or your preferred method.
+   Example using gettext macros:
+*/
+#include <locale.h>
+#include <libintl.h>
+
+#define _(String) gettext(String)
+
+/* Initialize localization somewhere in your main code:
+    setlocale(LC_ALL, "");
+    bindtextdomain("diskpart", "/usr/share/locale");
+    textdomain("diskpart");
+*/
+
+/* Then use in code:
+    printf(_("Disk Partitioning Tool\n"));
+*/
+
+/* Remove all #include "*.rc" files and replace translations by .po files */
